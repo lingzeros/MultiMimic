@@ -21,7 +21,7 @@ _ROOT = os.path.dirname(os.path.abspath(__file__))
 _LINKER_HAND_DIR = os.path.join(_ROOT, 'linker_hand_python_sdk', 'LinkerHand')
 _LINKER_SDK_DIR = os.path.join(_ROOT, 'linker_hand_python_sdk')
 
-CKPT_DIR = "/home/ub/act/checkpoints/Peach_resnet18_3"
+CKPT_DIR = "/home/ub/MultiMimic/checkpoints/Peach_dual_decoder"
 CKPT_TYPE = 'policy_best.ckpt'
 # CKPT_TYPE = 'policy_epoch_4800_seed_0.ckpt'
 # camera_names 是 depth encoder 的唯一开关；
@@ -293,11 +293,14 @@ def stop_cameras(cams):
 def _infer_act_shape_from_ckpt(state_dict):
     """从 ACT checkpoint 权重形状推断 chunk_size(=num_queries) 与 state_dim。"""
     qkey = 'model.query_embed.weight'
-    akey = 'model.action_head.weight'
+    arm_key = 'model.arm_action_head.weight'
+    hand_key = 'model.hand_action_head.weight'
     if qkey not in state_dict:
         raise KeyError(f'checkpoint 缺少 {qkey}，无法推断 chunk_size')
     num_queries = int(state_dict[qkey].shape[0])
-    state_dim = int(state_dict[akey].shape[0]) if akey in state_dict else STATE_DIM
+    if arm_key not in state_dict or hand_key not in state_dict:
+        raise KeyError('checkpoint 不是 arm/hand 双 decoder ACT 模型')
+    state_dim = int(state_dict[arm_key].shape[0] + state_dict[hand_key].shape[0])
     return num_queries, state_dim
 
 

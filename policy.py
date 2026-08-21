@@ -17,16 +17,7 @@ class ACTPolicy(nn.Module):
         env_state = None
         normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                          std=[0.229, 0.224, 0.225])
-        if isinstance(image, dict):
-            # RGB follows the pretrained backbone's ImageNet normalization;
-            # depth is already normalized to [0,1] by depth_utils and remains
-            # a genuine single channel.
-            image = {
-                name: tensor if "depth" in name.lower() else normalize(tensor)
-                for name, tensor in image.items()
-            }
-        else:
-            image = normalize(image)
+        image = normalize(image)
         if actions is not None: # training time
             actions = actions[:, :self.model.num_queries]
             is_pad = is_pad[:, :self.model.num_queries]

@@ -167,48 +167,6 @@ class DINOv2Backbone(nn.Module):
         return OrderedDict({"0": feature})
 
 
-class DepthEncoder(nn.Module):
-    """Trainable encoder for a normalized single-channel 480x640 depth map.
-
-    Five stride-2 stages produce a 15x20 feature map, matching both the
-    ResNet18 output at 480x640 and the DINOv2-S/14 output at 210x280.
-    GroupNorm is used because ACT commonly trains with small batch sizes.
-    """
-
-    def __init__(self):
-        super().__init__()
-        channels = (1, 32, 64, 128, 192, 256)
-        layers = []
-        for index, (in_channels, out_channels) in enumerate(
-            zip(channels[:-1], channels[1:])
-        ):
-            kernel_size = 7 if index == 0 else 3
-            padding = 3 if index == 0 else 1
-            layers.extend(
-                [
-                    nn.Conv2d(
-                        in_channels,
-                        out_channels,
-                        kernel_size=kernel_size,
-                        stride=2,
-                        padding=padding,
-                        bias=False,
-                    ),
-                    nn.GroupNorm(min(8, out_channels), out_channels),
-                    nn.GELU(),
-                ]
-            )
-        self.body = nn.Sequential(*layers)
-        self.num_channels = channels[-1]
-
-    def forward(self, tensor):
-        if tensor.ndim != 4 or tensor.shape[1] != 1:
-            raise ValueError(
-                f"depth encoder expects [B,1,H,W], got {tuple(tensor.shape)}"
-            )
-        return OrderedDict({"0": self.body(tensor)})
-
-
 class Joiner(nn.Sequential):
     def __init__(self, backbone, position_embedding):
         super().__init__(backbone, position_embedding)
@@ -250,12 +208,4 @@ def build_backbone(args):
         )
     model = Joiner(backbone, position_embedding)
     model.num_channels = backbone.num_channels
-    return model
-
-
-def build_depth_encoder(args):
-    """Build the optional depth encoder with ACT-compatible position encoding."""
-    encoder = DepthEncoder()
-    model = Joiner(encoder, build_position_encoding(args))
-    model.num_channels = encoder.num_channels
     return model

@@ -5,7 +5,7 @@ DETR model and criterion classes.
 import torch
 from torch import nn
 from torch.autograd import Variable
-from .backbone import build_backbone, build_depth_encoder
+from .backbone import build_backbone
 from .transformer import build_transformer, TransformerEncoder, TransformerEncoderLayer
 
 import numpy as np
@@ -39,7 +39,6 @@ class DETRVAE(nn.Module):
         state_dim,
         num_queries,
         camera_names,
-        depth_encoder=None,
     ):
         """ Initializes the model.
         Parameters:
@@ -51,35 +50,29 @@ class DETRVAE(nn.Module):
             aux_loss: True if auxiliary decoding losses (loss at each decoder layer) are to be used.
         """
         super().__init__()
+        self.arm_dim = 6
+        if state_dim <= self.arm_dim:
+            raise ValueError(
+                f"state_dim must contain 6 arm joints and at least one hand joint, got {state_dim}"
+            )
+        self.hand_dim = state_dim - self.arm_dim
         self.num_queries = num_queries
         self.camera_names = camera_names
-        self.rgb_camera_names = [
-            name for name in camera_names if "depth" not in name.lower()
-        ]
-        self.depth_camera_names = [
-            name for name in camera_names if "depth" in name.lower()
-        ]
-        self.use_depth = bool(self.depth_camera_names)
+        if not self.camera_names:
+            raise ValueError("ACT requires at least one RGB camera")
+        if any("depth" in name.lower() for name in self.camera_names):
+            raise ValueError("ACT is RGB-only; depth camera names are not supported")
         self.transformer = transformer
         self.encoder = encoder
         hidden_dim = transformer.d_model
-        self.action_head = nn.Linear(hidden_dim, state_dim)
+        self.arm_action_head = nn.Linear(hidden_dim, self.arm_dim)
+        self.hand_action_head = nn.Linear(hidden_dim, self.hand_dim)
         self.is_pad_head = nn.Linear(hidden_dim, 1)
         self.query_embed = nn.Embedding(num_queries, hidden_dim)
         if backbones is not None:
             self.input_proj = nn.Conv2d(backbones[0].num_channels, hidden_dim, kernel_size=1)
             self.backbones = nn.ModuleList(backbones)
             self.input_proj_robot_state = nn.Linear(state_dim, hidden_dim)
-            self.depth_encoder = depth_encoder
-            if self.use_depth:
-                if self.depth_encoder is None:
-                    raise ValueError("camera_names contains depth but no depth encoder was built")
-                self.depth_input_proj = nn.Conv2d(
-                    self.depth_encoder.num_channels,
-                    hidden_dim,
-                    kernel_size=1,
-                )
-                self.modality_embed = nn.Embedding(2, hidden_dim)
         else:
             # input_dim = 14 + 7 # robot_state + env_state
             self.input_proj_robot_state = nn.Linear(state_dim, hidden_dim)
@@ -141,50 +134,56 @@ class DETRVAE(nn.Module):
             # Image observation features and position embeddings
             all_cam_features = []
             all_cam_pos = []
-            if isinstance(image, dict):
-                missing = [name for name in self.camera_names if name not in image]
-                if missing:
-                    raise KeyError(f"model input is missing modalities: {missing}")
-            elif self.use_depth:
+            if not isinstance(image, torch.Tensor) or image.ndim != 5:
                 raise TypeError(
-                    "RGB+depth ACT expects a dict input keyed by camera_names"
+                    "RGB-only ACT expects image with shape [B,num_cameras,3,H,W]"
+                )
+            if image.shape[1] != len(self.camera_names) or image.shape[2] != 3:
+                raise ValueError(
+                    "RGB-only ACT image shape does not match camera_names: "
+                    f"image={tuple(image.shape)}, camera_names={self.camera_names}"
                 )
 
-            for cam_id, cam_name in enumerate(self.rgb_camera_names):
-                rgb = image[cam_name] if isinstance(image, dict) else image[:, cam_id]
+            for cam_id, _ in enumerate(self.camera_names):
+                rgb = image[:, cam_id]
                 features, pos = self.backbones[0](rgb) # shared RGB backbone
                 features = features[0] # take the last layer feature
                 pos = pos[0]
                 projected = self.input_proj(features)
-                if self.use_depth:
-                    projected = projected + self.modality_embed.weight[0][None, :, None, None]
                 all_cam_features.append(projected)
                 all_cam_pos.append(pos)
-
-            for depth_name in self.depth_camera_names:
-                features, pos = self.depth_encoder(image[depth_name])
-                features = features[0]
-                pos = pos[0]
-                projected = self.depth_input_proj(features)
-                projected = projected + self.modality_embed.weight[1][None, :, None, None]
-                all_cam_features.append(projected)
-                all_cam_pos.append(pos)
-
-            if not all_cam_features:
-                raise ValueError("ACT requires at least one RGB or depth observation")
             # proprioception features
             proprio_input = self.input_proj_robot_state(qpos)
             # fold camera dimension into width dimension
             src = torch.cat(all_cam_features, axis=3)
             pos = torch.cat(all_cam_pos, axis=3)
-            hs = self.transformer(src, None, self.query_embed.weight, pos, latent_input, proprio_input, self.additional_pos_embed.weight)[0]
+            arm_hs, hand_hs = self.transformer(
+                src,
+                None,
+                self.query_embed.weight,
+                pos,
+                latent_input,
+                proprio_input,
+                self.additional_pos_embed.weight,
+            )
+            arm_hs = arm_hs[0]
+            hand_hs = hand_hs[0]
         else:
             qpos = self.input_proj_robot_state(qpos)
             env_state = self.input_proj_env_state(env_state)
             transformer_input = torch.cat([qpos, env_state], axis=1) # seq length = 2
-            hs = self.transformer(transformer_input, None, self.query_embed.weight, self.pos.weight)[0]
-        a_hat = self.action_head(hs)
-        is_pad_hat = self.is_pad_head(hs)
+            arm_hs, hand_hs = self.transformer(
+                transformer_input,
+                None,
+                self.query_embed.weight,
+                self.pos.weight,
+            )
+            arm_hs = arm_hs[0]
+            hand_hs = hand_hs[0]
+        arm_hat = self.arm_action_head(arm_hs)
+        hand_hat = self.hand_action_head(hand_hs)
+        a_hat = torch.cat([arm_hat, hand_hat], dim=-1)
+        is_pad_hat = self.is_pad_head(arm_hs)
         return a_hat, is_pad_hat, [mu, logvar]
 
 
@@ -285,13 +284,8 @@ def build(args):
     backbones = []
     backbone = build_backbone(args)
     backbones.append(backbone)
-    has_depth = any("depth" in name.lower() for name in args.camera_names)
-    rgb_camera_names = [
-        name for name in args.camera_names if "depth" not in name.lower()
-    ]
-    if not rgb_camera_names:
-        raise ValueError("current ACT depth fusion requires at least one RGB camera")
-    depth_encoder = build_depth_encoder(args) if has_depth else None
+    if any("depth" in name.lower() for name in args.camera_names):
+        raise ValueError("ACT is RGB-only; remove depth entries from camera_names")
 
     transformer = build_transformer(args)
 
@@ -304,7 +298,6 @@ def build(args):
         state_dim=state_dim,
         num_queries=args.num_queries,
         camera_names=args.camera_names,
-        depth_encoder=depth_encoder,
     )
 
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)

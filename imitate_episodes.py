@@ -461,7 +461,7 @@ if __name__ == '__main__':
 
     # for ACT
     parser.add_argument('--kl_weight', default= 10, action='store', type=int, help='KL Weight', required=False)
-    parser.add_argument('--chunk_size', default= 100, action='store', type=int, help='chunk_size', required=False)
+    parser.add_argument('--chunk_size', default= 50, action='store', type=int, help='chunk_size', required=False)
     parser.add_argument('--hidden_dim', default= 512, action='store', type=int, help='hidden_dim', required=False)
     parser.add_argument('--dim_feedforward', default= 3200, action='store', type=int, help='dim_feedforward', required=False)
     parser.add_argument('--temporal_agg', action='store_true')

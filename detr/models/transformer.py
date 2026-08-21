@@ -30,9 +30,19 @@ class Transformer(nn.Module):
 
         decoder_layer = TransformerDecoderLayer(d_model, nhead, dim_feedforward,
                                                 dropout, activation, normalize_before)
-        decoder_norm = nn.LayerNorm(d_model)
-        self.decoder = TransformerDecoder(decoder_layer, num_decoder_layers, decoder_norm,
-                                          return_intermediate=return_intermediate_dec)
+        # Decoder 分为arm decoder和hand decoder，共享encoder memory
+        self.arm_decoder = TransformerDecoder(
+            decoder_layer,
+            num_decoder_layers,
+            nn.LayerNorm(d_model),
+            return_intermediate=return_intermediate_dec,
+        )
+        self.hand_decoder = TransformerDecoder(
+            copy.deepcopy(decoder_layer),
+            num_decoder_layers,
+            nn.LayerNorm(d_model),
+            return_intermediate=return_intermediate_dec,
+        )
 
         self._reset_parameters()
 
@@ -69,10 +79,21 @@ class Transformer(nn.Module):
 
         tgt = torch.zeros_like(query_embed)
         memory = self.encoder(src, src_key_padding_mask=mask, pos=pos_embed)
-        hs = self.decoder(tgt, memory, memory_key_padding_mask=mask,
-                          pos=pos_embed, query_pos=query_embed)
-        hs = hs.transpose(1, 2)
-        return hs
+        arm_hs = self.arm_decoder(
+            tgt,
+            memory,
+            memory_key_padding_mask=mask,
+            pos=pos_embed,
+            query_pos=query_embed,
+        )
+        hand_hs = self.hand_decoder(
+            tgt,
+            memory,
+            memory_key_padding_mask=mask,
+            pos=pos_embed,
+            query_pos=query_embed,
+        )
+        return arm_hs.transpose(1, 2), hand_hs.transpose(1, 2)
 
 class TransformerEncoder(nn.Module):
 
