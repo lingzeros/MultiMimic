@@ -21,9 +21,6 @@ from visualize_episodes import save_videos
 
 from sim_env import BOX_POSE
 
-import IPython
-e = IPython.embed
-
 def main(args):
     set_seed(1)
     # command line parameters
@@ -49,8 +46,9 @@ def main(args):
     episode_len = task_config['episode_len']
     camera_names = task_config['camera_names']
 
-    # state_dim: 真机 L10=16，ALOHA 仿真=14；由 --state_dim 传入
-    state_dim = args['state_dim']
+    # A task-specific dimension is authoritative (e.g. Inspire: arm 6 + hand 6
+    # = 12). Other tasks retain the CLI override for backward compatibility.
+    state_dim = task_config.get('state_dim', args['state_dim'])
     lr_backbone = 1e-5
     backbone = args['backbone']
     if policy_class == 'ACT':
@@ -69,6 +67,13 @@ def main(args):
                          'nheads': nheads,
                          'camera_names': camera_names,
                          'state_dim': state_dim,
+                         # FK is a training-only auxiliary loss and adds no
+                         # checkpoint parameters, so evaluation never builds it.
+                         'fk_pose_weight': (
+                             0.0 if is_eval else args['fk_pose_weight']
+                         ),
+                         'fk_rotation_weight': args['fk_rotation_weight'],
+                         'rm65_urdf': args['rm65_urdf'],
                          }
     elif policy_class == 'CNNMLP':
         policy_config = {'lr': args['lr'], 'lr_backbone': lr_backbone, 'backbone' : backbone, 'num_queries': 1,
@@ -106,7 +111,22 @@ def main(args):
         print()
         exit()
 
-    train_dataloader, val_dataloader, stats, _ = load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_size_val)
+    use_fk_pose = policy_class == 'ACT' and args['fk_pose_weight'] > 0
+    train_dataloader, val_dataloader, stats, _ = load_data(
+        dataset_dir,
+        num_episodes,
+        camera_names,
+        batch_size_train,
+        batch_size_val,
+        use_fk_pose=use_fk_pose,
+        state_dim=state_dim,
+    )
+    if use_fk_pose:
+        policy_config.update({
+            'action_mean': stats['action_mean'],
+            'action_std': stats['action_std'],
+            'wrist_pose_std': stats['wrist_pose_std'],
+        })
 
     # save dataset stats
     if not os.path.isdir(ckpt_dir):
@@ -320,7 +340,13 @@ def eval_bc(config, ckpt_name, save_episode=True):
 
 
 def forward_pass(data, policy):
-    image_data, qpos_data, action_data, is_pad = data
+    if len(data) == 5:
+        image_data, qpos_data, action_data, is_pad, pose_gt = data
+    elif len(data) == 4:
+        image_data, qpos_data, action_data, is_pad = data
+        pose_gt = None
+    else:
+        raise ValueError(f'Unexpected training batch with {len(data)} elements')
     if isinstance(image_data, dict):
         image_data = {
             name: tensor.cuda(non_blocking=True)
@@ -331,7 +357,11 @@ def forward_pass(data, policy):
     qpos_data = qpos_data.cuda(non_blocking=True)
     action_data = action_data.cuda(non_blocking=True)
     is_pad = is_pad.cuda(non_blocking=True)
-    return policy(qpos_data, image_data, action_data, is_pad) # TODO remove None
+    if pose_gt is not None:
+        pose_gt = pose_gt.cuda(non_blocking=True)
+    return policy(
+        qpos_data, image_data, action_data, is_pad, pose_gt=pose_gt,
+    )
 
 
 def train_bc(train_dataloader, val_dataloader, config):
@@ -466,11 +496,41 @@ if __name__ == '__main__':
     parser.add_argument('--dim_feedforward', default= 3200, action='store', type=int, help='dim_feedforward', required=False)
     parser.add_argument('--temporal_agg', action='store_true')
     parser.add_argument(
+        '--fk_pose_weight',
+        default=0.0,
+        action='store',
+        type=float,
+        help=(
+            'RM65 FK wrist-pose auxiliary loss weight; 0 disables it and '
+            'preserves the original training path'
+        ),
+    )
+    parser.add_argument(
+        '--fk_rotation_weight',
+        default=1.0,
+        action='store',
+        type=float,
+        help='rotation term weight inside the FK pose loss',
+    )
+    parser.add_argument(
+        '--rm65_urdf',
+        default=(
+            '/home/ub/snap/Projects/DRO-Grasp-master/'
+            'data/data_urdf/robot/rm65b/RM65-B.urdf'
+        ),
+        action='store',
+        type=str,
+        help='RM65-B URDF used by differentiable FK supervision',
+    )
+    parser.add_argument(
         '--state_dim',
         default=16,
         action='store',
         type=int,
-        help='qpos/action 维度：真机 RM65+L10=16，ALOHA 仿真=14',
+        help=(
+            'qpos/action 维度：RM65+L10=16，RM65+Inspire=12，ALOHA=14；'
+            '若任务配置包含 state_dim，则任务配置优先'
+        ),
         required=False,
     )
 

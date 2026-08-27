@@ -1,8 +1,5 @@
 # eval.py
-"""
-RM65 + LinkerHand L10 真机部署脚本（ACT）
-借鉴 mimic_inference.py 的 L10 驱动方式：LinkerHandApi + finger_move
-"""
+"""RM65 + L10/Inspire 灵巧手真机部署脚本（ACT）。"""
 import os
 import sys
 import time
@@ -21,7 +18,7 @@ _ROOT = os.path.dirname(os.path.abspath(__file__))
 _LINKER_HAND_DIR = os.path.join(_ROOT, 'linker_hand_python_sdk', 'LinkerHand')
 _LINKER_SDK_DIR = os.path.join(_ROOT, 'linker_hand_python_sdk')
 
-CKPT_DIR = "/home/ub/MultiMimic/checkpoints/Peach_dual_decoder"
+CKPT_DIR = "/home/ub/MultiMimic/checkpoints/Peach_dual_decoder_inspire1"
 CKPT_TYPE = 'policy_best.ckpt'
 # CKPT_TYPE = 'policy_epoch_4800_seed_0.ckpt'
 # camera_names 是 depth encoder 的唯一开关；
@@ -31,6 +28,9 @@ CAMERA_MODE = 'front'
 # CAMERA_MODE = 'dual'
 # CAMERA_MODE = 'front_depth'
 # CAMERA_MODE = 'dual_depth'
+
+# 灵巧手类型：'l10'（LinkerHand 10维）或 'inspire'（因时6维）
+ROBOT_HAND = 'inspire'
 
 def _import_linker_hand_api():
     """导入 LinkerHandApi，规避与 act/utils.py 的命名冲突。"""
@@ -59,15 +59,37 @@ from policy import ACTPolicy, CNNMLPPolicy
 # ─── 硬件默认配置 ───────────────────────────────────────────────
 ARM_IP = '192.168.1.18'
 ARM_PORT = 8080
-HAND_JOINT = 'L10'          # LinkerHand 型号
-HAND_TYPE = 'right'         # left / right
+HAND_JOINT = 'L10'          # LinkerHand 型号，仅 L10 模式使用
+HAND_TYPE = 'right'         # left / right，仅 L10 模式使用
 CAN_INTERFACE = 'can0'
-HAND_DIM = 10
-STATE_DIM = 6 + HAND_DIM    # 16
 HAND_SPEED = [180, 250, 250, 250, 250]
 HAND_TORQUE = [255, 255, 255, 255, 255]
-# 张开手掌姿态（SDK L10 open_palm 示例）
-HAND_INIT_POSE = [255.0, 70.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0, 255.0]
+
+HAND_CONFIGS = {
+    'l10': {
+        'dim': 10,
+        'min': 0.0,
+        'max': 255.0,
+        'max_step': 45.0,
+        # LinkerHand SDK open_palm 示例
+        'init_pose': [255.0, 70.0, 255.0, 255.0, 255.0,
+                      255.0, 255.0, 255.0, 255.0, 255.0],
+    },
+    'inspire': {
+        'dim': 6,
+        'min': 0.0,
+        'max': 1000.0,
+        'max_step': 150.0,
+        # 与 Inspire 训练数据每条 episode 的初始 hand_joints 一致
+        'init_pose': [1000.0, 1000.0, 1000.0, 1000.0, 1000.0, 0.0],
+    },
+}
+if ROBOT_HAND not in HAND_CONFIGS:
+    raise ValueError(f'ROBOT_HAND 必须是 {list(HAND_CONFIGS)}, 实际为 {ROBOT_HAND!r}')
+HAND_CONFIG = HAND_CONFIGS[ROBOT_HAND]
+HAND_DIM = HAND_CONFIG['dim']
+STATE_DIM = 6 + HAND_DIM
+HAND_INIT_POSE = list(HAND_CONFIG['init_pose'])
 # ARM_HOME = [-8, 12, 98, 59, 19, -20]
 ARM_HOME = [-2.4, -9.4, 100.3, 1.3, 43.5, -1.9]
 
@@ -87,9 +109,9 @@ CAMERA_SERIALS = {
     'wrist_RGB': WRIST_CAMERA_SERIAL,
 }
 
-# 手部限速（L10：0~255）
+# 机械臂/灵巧手单次指令限幅
 ARM_MAX_STEP = [5, 5, 5, 5, 5, 5]
-HAND_MAX_STEP = 45                    # 每步每关节最大变化（0~255）
+HAND_MAX_STEP = HAND_CONFIG['max_step']
 
 
 class L10HandController:
@@ -128,7 +150,7 @@ class L10HandController:
         time.sleep(0.5)
         print(f'✓ LinkerHand {self.hand_type} {self.hand_joint} 初始化完成 (can={self.can})')
 
-    def move(self, qpos):
+    def move(self, qpos, force=False):
         """下发 10 维关节指令，数值范围 0~255。"""
         pose = [float(np.clip(x, 0, 255)) for x in qpos]
         if len(pose) != HAND_DIM:
@@ -145,6 +167,84 @@ class L10HandController:
         except Exception:
             pass
         return list(self._last_qpos)
+
+
+class InspireHandController:
+    """通过 RM65 末端 Modbus 控制6维 Inspire 灵巧手。
+
+    采集程序没有读取手指位置反馈，因此这里同样使用最近一次成功下发的
+    指令作为 hand state，以保持训练和部署的观测语义一致。
+    """
+
+    def __init__(self, arm, command_interval=3):
+        self._arm = arm
+        self._last_qpos = list(HAND_INIT_POSE)
+        self._command_interval = command_interval
+        self._move_count = 0
+        self._modbus_open = False
+
+    def connect(self, init_pose=None):
+        # 上一次进程若异常退出，RM65 控制器端的末端 RS485 可能仍处于
+        # Modbus RTU 模式。先尝试关闭旧模式，再重新初始化。
+        try:
+            self._arm.rm_close_modbus_mode(1)
+            time.sleep(0.5)
+        except Exception as exc:
+            print(f'⚠ 清理旧Inspire Modbus状态失败，将继续尝试初始化: {exc}')
+
+        result = self._arm.rm_set_modbus_mode(1, 115200, 2)
+        if result not in (0, None):
+            raise RuntimeError(f'rm_set_modbus_mode失败: {result}')
+        self._modbus_open = True
+        time.sleep(0.5)
+        try:
+            result = self._arm.rm_set_voltage(3, True)
+        except TypeError:
+            # 兼容不带 block 参数的 RM API 版本。
+            result = self._arm.rm_set_voltage(3)
+        if result not in (0, None):
+            raise RuntimeError(f'rm_set_voltage失败: {result}')
+        time.sleep(0.5)
+
+        speed_force = [2, 232] * HAND_DIM
+        params = rm_peripheral_read_write_params_t(1, 1522, 1, HAND_DIM)
+        result = self._arm.rm_write_registers(params, speed_force)
+        if result not in (0, None):
+            raise RuntimeError(f'Inspire速度/力阈值设置失败: {result}')
+
+        pose = list(init_pose) if init_pose is not None else list(HAND_INIT_POSE)
+        self.move(pose, force=True)
+        time.sleep(0.5)
+        print('✓ Inspire 灵巧手初始化完成 (RM65 Modbus, 6 DoF)')
+
+    def move(self, qpos, force=False):
+        if len(qpos) != HAND_DIM:
+            raise ValueError(f'Inspire pose需要{HAND_DIM}维，实际{len(qpos)}')
+        pose = [
+            int(round(np.clip(x, HAND_CONFIG['min'], HAND_CONFIG['max'])))
+            for x in qpos
+        ]
+        self._move_count += 1
+        if not force and self._move_count % self._command_interval != 0:
+            return
+        result = self._arm.rm_set_hand_angle(pose, False, 0)
+        if result not in (0, None):
+            raise RuntimeError(f'rm_set_hand_angle失败: {result}')
+        self._last_qpos = [float(x) for x in pose]
+
+    def get_state(self):
+        return list(self._last_qpos)
+
+    def close(self):
+        """释放RM65末端RS485的Modbus模式，供下次运行重新初始化。"""
+        if not self._modbus_open:
+            return
+        result = self._arm.rm_close_modbus_mode(1)
+        if result not in (0, None):
+            print(f'⚠ 关闭Inspire Modbus返回: {result}')
+        else:
+            print('✓ Inspire Modbus已关闭')
+        self._modbus_open = False
 
 
 def safe_action_filter(
@@ -164,14 +264,16 @@ def safe_action_filter(
         if abs(diff) > arm_max_step[i]:
             action[i] = current_qpos[i] + np.sign(diff) * arm_max_step[i]
 
-    hand = np.clip(action[6:6 + HAND_DIM], 0, 255)
+    hand = np.clip(
+        action[6:6 + HAND_DIM], HAND_CONFIG['min'], HAND_CONFIG['max']
+    )
     hand_obs = current_qpos[6:6 + HAND_DIM]
 
     for i in range(HAND_DIM):
         diff = hand[i] - hand_obs[i]
         if abs(diff) > hand_max_step:
             hand[i] = hand_obs[i] + np.sign(diff) * hand_max_step
-    hand = np.clip(hand, 0, 255)
+    hand = np.clip(hand, HAND_CONFIG['min'], HAND_CONFIG['max'])
     action[6:6 + HAND_DIM] = hand
     return action
 
@@ -205,15 +307,24 @@ def init_robot():
         return None
 
 
-def init_hand():
-    """初始化 LinkerHand L10。"""
-    print('=== 初始化 LinkerHand L10 ===')
+def init_hand(left_arm):
+    """根据 ROBOT_HAND 初始化 L10 或 Inspire。"""
+    print(f'=== 初始化灵巧手: {ROBOT_HAND} ===')
+    hand = None
     try:
-        hand = L10HandController()
+        if ROBOT_HAND == 'l10':
+            hand = L10HandController()
+        else:
+            hand = InspireHandController(left_arm)
         hand.connect()
         return hand
     except Exception as e:
-        print(f'✗ L10 初始化失败: {e}')
+        print(f'✗ {ROBOT_HAND} 初始化失败: {e}')
+        if hand is not None and hasattr(hand, 'close'):
+            try:
+                hand.close()
+            except Exception as close_exc:
+                print(f'⚠ 初始化失败后的Modbus清理也失败: {close_exc}')
         return None
 
 
@@ -288,6 +399,26 @@ def stop_cameras(cams):
             pipeline.stop()
         except Exception:
             pass
+
+
+def cleanup_resources(left_arm=None, hand=None, cams=None):
+    """按相机→灵巧手Modbus→机械臂的顺序释放所有部署资源。"""
+    stop_cameras(cams)
+    if hand is not None and hasattr(hand, 'close'):
+        try:
+            hand.close()
+        except Exception as exc:
+            print(f'⚠ 关闭灵巧手通信失败: {exc}')
+    if left_arm is not None:
+        try:
+            left_arm.rm_delete_robot_arm()
+        except Exception as exc:
+            print(f'⚠ 断开机械臂失败: {exc}')
+        try:
+            RoboticArm.rm_destroy()
+        except Exception as exc:
+            print(f'⚠ 销毁机械臂SDK失败: {exc}')
+    cv2.destroyAllWindows()
 
 
 def _infer_act_shape_from_ckpt(state_dict):
@@ -404,6 +535,13 @@ def load_policy(ckpt_dir, policy_class, camera_names=None):
             }
             print('⚠ 未找到 dataset_stats.pkl，使用单位归一化')
 
+        for key in ('qpos_mean', 'qpos_std', 'action_mean', 'action_std'):
+            if np.asarray(stats[key]).shape != (policy_config['state_dim'],):
+                raise ValueError(
+                    f'{key} shape={np.asarray(stats[key]).shape} 与 checkpoint '
+                    f'state_dim={policy_config["state_dim"]} 不一致'
+                )
+
         return policy, policy_config, stats
     except Exception as e:
         print(f'✗ 策略加载失败: {e}')
@@ -498,7 +636,7 @@ def images_to_tensor(obs_images, camera_names=None):
 
 
 def execute_action(left_arm, hand, action):
-    """执行：臂 movej_canfd + L10 finger_move。"""
+    """执行机械臂及当前配置的灵巧手动作。"""
     try:
         joint_action = action[:6]
         hand_action = action[6:6 + HAND_DIM]
@@ -518,7 +656,7 @@ def execute_action(left_arm, hand, action):
 
 
 def main():
-    print('=== RM65 + LinkerHand L10 ACT 部署 ===')
+    print(f'=== RM65 + {ROBOT_HAND} ACT 部署 ===')
     ckpt_dir = CKPT_DIR
     # if not os.path.exists(ckpt_dir):
     #     print(f'错误: 目录不存在 {ckpt_dir}')
@@ -530,9 +668,10 @@ def main():
     #     print('错误: 策略类型必须是 ACT 或 CNNMLP')
     #     return
 
-    max_steps = int(input('请输入最大执行步数 (默认1000): ').strip() or '1000')
+    # max_steps = int(input('请输入最大执行步数 (默认1000): ').strip() or '1000')
+    max_steps = 210
     # 与 imitate_episodes.eval_bc 一致：对重叠 chunk 做指数加权平滑
-    temporal_agg = True
+    temporal_agg = False
 
     camera_mode = CAMERA_MODE
 
@@ -540,25 +679,35 @@ def main():
     if left_arm is None:
         return
 
-    hand = init_hand()
+    hand = init_hand(left_arm)
     if hand is None:
+        cleanup_resources(left_arm=left_arm)
         return
 
     camera_names = list(CAMERA_MODES[camera_mode])
     print(f'camera_mode={camera_mode}, camera_names={camera_names}')
     cams = init_cameras(camera_names)
     if cams is None:
+        cleanup_resources(left_arm=left_arm, hand=hand)
         return
 
     policy, policy_config, stats = load_policy(ckpt_dir, policy_class, camera_names)
     if policy is None:
-        stop_cameras(cams)
+        cleanup_resources(left_arm=left_arm, hand=hand, cams=cams)
+        return
+    ckpt_state_dim = policy_config['state_dim']
+    if ckpt_state_dim != STATE_DIM:
+        print(
+            f'✗ checkpoint state_dim={ckpt_state_dim} 与 ROBOT_HAND={ROBOT_HAND} '
+            f'所需 state_dim={STATE_DIM} 不一致'
+        )
+        cleanup_resources(left_arm=left_arm, hand=hand, cams=cams)
         return
 
     # 与 imitate_episodes 一致：temporal_agg 时每步重查询；否则间隔 = chunk_size
     query_frequency = policy_config['num_queries'] if policy_class == 'ACT' else 1
     num_queries = policy_config['num_queries']
-    execution_horizon = 25
+    execution_horizon = 20
     if  policy_class == 'ACT':
         if temporal_agg:
             query_frequency = 1
@@ -572,12 +721,16 @@ def main():
 
     print('\n=== 系统初始化完成 ===')
     print(f'cameras={camera_names}')
-    print(f'hand safety: max_step={HAND_MAX_STEP}')
+    print(
+        f'hand={ROBOT_HAND}, dim={HAND_DIM}, '
+        f'range=[{HAND_CONFIG["min"]}, {HAND_CONFIG["max"]}], '
+        f'max_step={HAND_MAX_STEP}'
+    )
     input('按Enter开始执行...')
 
     print('重置机械臂与灵巧手到初始位置...')
     left_arm.rm_movej(ARM_HOME, 60, 0, 0, 1)
-    hand.move(HAND_INIT_POSE)
+    hand.move(HAND_INIT_POSE, force=True)
     time.sleep(3)
 
     try:
@@ -590,7 +743,7 @@ def main():
         all_time_actions = None
         if temporal_agg and policy_class == 'ACT':
             all_time_actions = torch.zeros(
-                [max_steps, max_steps + num_queries, STATE_DIM]
+                [max_steps, max_steps + num_queries, ckpt_state_dim]
             ).cuda()
 
         for step in range(max_steps):
@@ -620,8 +773,7 @@ def main():
                         exp_weights = torch.from_numpy(exp_weights).cuda().unsqueeze(dim=1)
                         raw_action = (actions_for_curr_step * exp_weights).sum(dim=0, keepdim=True)
                     else:
-                        # raw_action = all_actions[:, step % query_frequency]
-                        raw_action = all_actions[:, 1]
+                        raw_action = all_actions[:, step % query_frequency]
                 else:
                     raw_action = policy(qpos_tensor, curr_image)
 
@@ -657,7 +809,10 @@ def main():
                         cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
             cv2.putText(display_img, "Press 'q' to quit, 'r' to reset", (10, 70),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-            cv2.imshow('RM65 + L10 ACT Deployment (front | wrist)', display_img)
+            cv2.imshow(
+                f'RM65 + {ROBOT_HAND} ACT Deployment (front | wrist)',
+                display_img,
+            )
 
             key = cv2.waitKey(1) & 0xFF
             if key == ord('q'):
@@ -666,7 +821,7 @@ def main():
             elif key == ord('r'):
                 print('\n重置机械臂...')
                 left_arm.rm_movej(ARM_HOME, 60, 0, 0, 1)
-                hand.move(HAND_INIT_POSE)
+                hand.move(HAND_INIT_POSE, force=True)
                 time.sleep(2)
                 # 重置后清空 temporal 缓冲，避免旧预测污染
                 if all_time_actions is not None:
@@ -682,14 +837,8 @@ def main():
     except Exception as e:
         print(f'\n执行出错: {e}')
     finally:
-        try:
-            stop_cameras(cams)
-            left_arm.rm_delete_robot_arm()
-            RoboticArm.rm_destory()
-            cv2.destroyAllWindows()
-            print('✓ 资源清理完成')
-        except Exception:
-            pass
+        cleanup_resources(left_arm=left_arm, hand=hand, cams=cams)
+        print('✓ 资源清理完成')
 
 
 if __name__ == '__main__':

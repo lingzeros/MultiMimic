@@ -66,6 +66,12 @@ def get_args_parser():
     parser.add_argument('--temporal_agg', action='store_true')
     parser.add_argument('--state_dim', default=14, action='store', type=int,
                         help='qpos/action dim (overridden by policy_config)')
+    parser.add_argument('--fk_pose_weight', default=0.0, action='store', type=float,
+                        help='FK pose loss weight (overridden by policy_config)')
+    parser.add_argument('--fk_rotation_weight', default=1.0, action='store', type=float,
+                        help='FK rotation loss weight (overridden by policy_config)')
+    parser.add_argument('--rm65_urdf', default=None, action='store', type=str,
+                        help='RM65-B URDF path (overridden by policy_config)')
 
     return parser
 

@@ -85,7 +85,16 @@ SIM_TASK_CONFIGS = {
         'dataset_dir': '/mnt/additional/Data/DexMimic_Data/Robot_data_ACT/Peach_in_bowl',
         'num_episodes': 300,
         'episode_len': 250,
-        'camera_names': ['front_RGB', 'front_depth']
+        'camera_names': ['front_RGB', 'front_depth'],
+        'state_dim': 16,
+    },
+    'sim_Peach_in_bowl_inspire':{
+        'dataset_dir': '/mnt/additional/Data/DexMimic_Data/Robot_data_ACT/Peach_in_bowl/inspire',
+        'num_episodes': 299,
+        'episode_len': 130,
+        'camera_names': ['front_RGB'],
+        # RM65 arm (6) + Inspire hand (6).
+        'state_dim': 12,
     }
 }
 

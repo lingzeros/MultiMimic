@@ -6,9 +6,6 @@ from torch.utils.data import TensorDataset, DataLoader
 
 from depth_utils import is_depth_name, normalize_depth
 
-import IPython
-e = IPython.embed
-
 # class EpisodicDataset(torch.utils.data.Dataset):
 #     def __init__(self, episode_ids, dataset_dir, camera_names, norm_stats):
 #         super(EpisodicDataset).__init__()
@@ -79,7 +76,8 @@ e = IPython.embed
 
 # 可选的截断版本 - 如果不想填充太多零的话
 class EpisodicDataset(torch.utils.data.Dataset):
-    def __init__(self, episode_ids, dataset_dir, camera_names, norm_stats, fixed_len=300):
+    def __init__(self, episode_ids, dataset_dir, camera_names, norm_stats,
+                 fixed_len=300, use_fk_pose=False):
         super(EpisodicDataset).__init__()
         self.episode_ids = episode_ids
         self.dataset_dir = dataset_dir
@@ -87,6 +85,7 @@ class EpisodicDataset(torch.utils.data.Dataset):
         self.norm_stats = norm_stats
         self.is_sim = None
         self.fixed_len = fixed_len  # 固定长度，可以设为你数据的中位数长度
+        self.use_fk_pose = use_fk_pose
         
         self.__getitem__(0) # initialize self.is_sim
 
@@ -127,12 +126,26 @@ class EpisodicDataset(torch.utils.data.Dataset):
                         f'/observations/images/{cam_name}'
                     ][start_ts]
             # get all actions after and including start_ts
-            if is_sim:
-                action = root['/action'][start_ts:]
-                action_len = episode_len - start_ts
-            else:
-                action = root['/action'][max(0, start_ts - 1):] # hack, to make timesteps more aligned
-                action_len = episode_len - max(0, start_ts - 1) # hack, to make timesteps more aligned
+            action_start = start_ts if is_sim else max(0, start_ts - 1)
+            action = root['/action'][action_start:]
+            action_len = episode_len - action_start
+            wrist_pose_action = None
+            if self.use_fk_pose:
+                pose_key = '/action_wrist_pose_base'
+                if pose_key not in root:
+                    raise KeyError(
+                        f'{pose_key} not found in {dataset_path}; re-run '
+                        'convert_to_act_schema.py so FK pose supervision has '
+                        'future wrist-pose GT'
+                    )
+                wrist_pose_action = np.asarray(
+                    root[pose_key][action_start:], dtype=np.float32,
+                )
+                if wrist_pose_action.shape != (action_len, 6):
+                    raise ValueError(
+                        f'unexpected {pose_key} shape {wrist_pose_action.shape} '
+                        f'in {dataset_path}; expected ({action_len}, 6)'
+                    )
 
         self.is_sim = is_sim
         
@@ -140,6 +153,10 @@ class EpisodicDataset(torch.utils.data.Dataset):
         padded_action = np.zeros((self.fixed_len, original_action_shape[1]), dtype=np.float32)
         actual_len = min(action_len, self.fixed_len)
         padded_action[:actual_len] = action[:actual_len]
+        padded_wrist_pose = None
+        if self.use_fk_pose:
+            padded_wrist_pose = np.zeros((self.fixed_len, 6), dtype=np.float32)
+            padded_wrist_pose[:actual_len] = wrist_pose_action[:actual_len]
         
         is_pad = np.zeros(self.fixed_len)
         is_pad[actual_len:] = 1
@@ -174,6 +191,9 @@ class EpisodicDataset(torch.utils.data.Dataset):
         action_data = (action_data - self.norm_stats["action_mean"]) / self.norm_stats["action_std"]
         qpos_data = (qpos_data - self.norm_stats["qpos_mean"]) / self.norm_stats["qpos_std"]
 
+        if self.use_fk_pose:
+            wrist_pose_data = torch.from_numpy(padded_wrist_pose).float()
+            return image_data, qpos_data, action_data, is_pad, wrist_pose_data
         return image_data, qpos_data, action_data, is_pad
 
 # def get_norm_stats(dataset_dir, num_episodes):
@@ -207,9 +227,10 @@ class EpisodicDataset(torch.utils.data.Dataset):
 
 #     return stats
 
-def get_norm_stats(dataset_dir, num_episodes):
+def get_norm_stats(dataset_dir, num_episodes, use_fk_pose=False):
     all_qpos_data = []
     all_action_data = []
+    all_wrist_pose_data = []
     
     # 第一步：找到所有episode中的最大长度
     max_len = 0
@@ -244,6 +265,20 @@ def get_norm_stats(dataset_dir, num_episodes):
             qpos = root['/observations/qpos'][()]
             # qvel = root['/observations/qvel'][()]
             action = root['/action'][()]
+            wrist_pose = None
+            if use_fk_pose:
+                pose_key = '/action_wrist_pose_base'
+                if pose_key not in root:
+                    raise KeyError(
+                        f'{pose_key} not found in {dataset_path}; re-run '
+                        'convert_to_act_schema.py before enabling --fk_pose_weight'
+                    )
+                wrist_pose = np.asarray(root[pose_key][()], dtype=np.float32)
+                if wrist_pose.shape != (len(qpos), 6):
+                    raise ValueError(
+                        f'unexpected {pose_key} shape {wrist_pose.shape} '
+                        f'in {dataset_path}; expected ({len(qpos)}, 6)'
+                    )
             
             current_len = len(qpos)
             
@@ -255,6 +290,10 @@ def get_norm_stats(dataset_dir, num_episodes):
                 # 使用最后一个值进行填充 (edge padding)
                 qpos_padded = np.pad(qpos, ((0, pad_len), (0, 0)), mode='edge')
                 action_padded = np.pad(action, ((0, pad_len), (0, 0)), mode='edge')
+                if use_fk_pose:
+                    wrist_pose_padded = np.pad(
+                        wrist_pose, ((0, pad_len), (0, 0)), mode='edge'
+                    )
                 
                 # 或者使用零填充（根据需要选择）
                 # qpos_padded = np.pad(qpos, ((0, pad_len), (0, 0)), mode='constant', constant_values=0)
@@ -263,9 +302,13 @@ def get_norm_stats(dataset_dir, num_episodes):
             else:
                 qpos_padded = qpos
                 action_padded = action
+                if use_fk_pose:
+                    wrist_pose_padded = wrist_pose
             
             all_qpos_data.append(torch.from_numpy(qpos_padded))
             all_action_data.append(torch.from_numpy(action_padded))
+            if use_fk_pose:
+                all_wrist_pose_data.append(torch.from_numpy(wrist_pose_padded))
     
     # 现在所有张量都有相同的长度，可以安全地stack
     all_qpos_data = torch.stack(all_qpos_data)
@@ -289,10 +332,20 @@ def get_norm_stats(dataset_dir, num_episodes):
              "qpos_mean": qpos_mean.numpy().squeeze(), "qpos_std": qpos_std.numpy().squeeze(),
              "example_qpos": qpos}
 
+    if use_fk_pose:
+        all_wrist_pose_data = torch.stack(all_wrist_pose_data)
+        wrist_pose_mean = all_wrist_pose_data.mean(dim=[0, 1], keepdim=True)
+        wrist_pose_std = all_wrist_pose_data.std(dim=[0, 1], keepdim=True)
+        wrist_pose_std = torch.clip(wrist_pose_std, 1e-4, np.inf)
+        stats['wrist_pose_mean'] = wrist_pose_mean.numpy().squeeze()
+        stats['wrist_pose_std'] = wrist_pose_std.numpy().squeeze()
+        print(f"wrist pose shape: {all_wrist_pose_data.shape}")
+
     return stats
 
 
-def load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_size_val):
+def load_data(dataset_dir, num_episodes, camera_names, batch_size_train,
+              batch_size_val, use_fk_pose=False, state_dim=None):
     print(f'\nData from: {dataset_dir}\n')
     # obtain train test split
     train_ratio = 0.8
@@ -301,11 +354,28 @@ def load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_s
     val_indices = shuffled_indices[int(train_ratio * num_episodes):]
 
     # obtain normalization stats for qpos and action
-    norm_stats = get_norm_stats(dataset_dir, num_episodes)
+    norm_stats = get_norm_stats(
+        dataset_dir, num_episodes, use_fk_pose=use_fk_pose,
+    )
+    if state_dim is not None:
+        qpos_dim = int(np.asarray(norm_stats['qpos_mean']).shape[0])
+        action_dim = int(np.asarray(norm_stats['action_mean']).shape[0])
+        if qpos_dim != state_dim or action_dim != state_dim:
+            raise ValueError(
+                'Configured state_dim does not match dataset: '
+                f'state_dim={state_dim}, qpos_dim={qpos_dim}, '
+                f'action_dim={action_dim}, dataset_dir={dataset_dir}'
+            )
 
     # construct dataset and dataloader
-    train_dataset = EpisodicDataset(train_indices, dataset_dir, camera_names, norm_stats)
-    val_dataset = EpisodicDataset(val_indices, dataset_dir, camera_names, norm_stats)
+    train_dataset = EpisodicDataset(
+        train_indices, dataset_dir, camera_names, norm_stats,
+        use_fk_pose=use_fk_pose,
+    )
+    val_dataset = EpisodicDataset(
+        val_indices, dataset_dir, camera_names, norm_stats,
+        use_fk_pose=use_fk_pose,
+    )
     train_dataloader = DataLoader(train_dataset, batch_size=batch_size_train, shuffle=True, pin_memory=True, num_workers=1, prefetch_factor=1)
     val_dataloader = DataLoader(val_dataset, batch_size=batch_size_val, shuffle=True, pin_memory=True, num_workers=1, prefetch_factor=1)
 

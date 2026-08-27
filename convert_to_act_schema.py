@@ -2,11 +2,16 @@
 将自采 teleop HDF5 补齐为 ACT 训练所需 schema。
 
 输入:  teleop_episode_*.hdf5 或 episode_*.hdf5
-       含 observations/arm_joints (T,6) + observations/hand_joints (T,10)
+       含 observations/arm_joints (T,6) + observations/hand_joints
+       LinkerHand L10: hand_joints (T,10)
+       Inspire:        hand_joints (T,6)
+         + 可选 observations/wrist_pose_base (T,6)
          + observations/images/<cam> （默认 front_RGB + wrist_RGB）
 输出:  episode_{源文件编号}.hdf5（保留源 episode 编号，不重排）
-       /observations/qpos  = concat(arm, hand)  (T, 16) float32
-       /action             = qpos[t+1], 末帧重复  (T, 16) float32
+       /observations/qpos  = concat(arm, hand)  (T, 12或16) float32
+       /action             = qpos[t+1], 末帧重复  (T, 12或16) float32
+       /observations/wrist_pose_base = 当前 wrist pose（源文件存在时）
+       /action_wrist_pose_base       = wrist_pose_base[t+1]（FK 辅助监督 GT）
        RGB:   /observations/images/<cam>
        depth: /observations/depth/<cam>（camera_names 中名称含 depth 时）
        attrs['sim'] = False
@@ -20,7 +25,11 @@ import h5py
 import numpy as np
 from tqdm import tqdm
 
-DEFAULT_CAMERA_NAMES = ['front_RGB', 'wrist_RGB']
+DEFAULT_CAMERA_NAMES = ['front_RGB']
+HAND_DIMS = {
+    'l10': 10,
+    'inspire': 6,
+}
 
 
 def is_depth_name(name):
@@ -47,7 +56,33 @@ def parse_camera_names(s):
     return names
 
 
-def convert_episode(src_path, dst_path, camera_names=None, compression=None):
+def resolve_hand_type(hand_type, hand_dim, src_path):
+    """根据参数或 hand_joints 维数确定手型，并严格校验。"""
+    if hand_type == 'auto':
+        matches = [name for name, dim in HAND_DIMS.items() if dim == hand_dim]
+        if not matches:
+            raise ValueError(
+                f'无法从 hand_joints shape 推断手型: dim={hand_dim} in {src_path}; '
+                f'支持的维数为 {HAND_DIMS}'
+            )
+        return matches[0]
+
+    expected_dim = HAND_DIMS[hand_type]
+    if hand_dim != expected_dim:
+        raise ValueError(
+            f'--hand_type {hand_type} 需要 hand_joints dim={expected_dim}, '
+            f'实际 dim={hand_dim} in {src_path}'
+        )
+    return hand_type
+
+
+def convert_episode(
+    src_path,
+    dst_path,
+    camera_names=None,
+    compression=None,
+    hand_type='auto',
+):
     """compression: None / 'gzip' / 'lzf'。图像按帧 chunk，便于训练随机读。"""
     if camera_names is None:
         camera_names = list(DEFAULT_CAMERA_NAMES)
@@ -57,15 +92,29 @@ def convert_episode(src_path, dst_path, camera_names=None, compression=None):
         hand = np.asarray(src['/observations/hand_joints'][()], dtype=np.float32)
         if arm.ndim != 2 or arm.shape[1] != 6:
             raise ValueError(f'unexpected arm_joints shape {arm.shape} in {src_path}')
-        if hand.ndim != 2 or hand.shape[1] != 10:
+        if hand.ndim != 2:
             raise ValueError(f'unexpected hand_joints shape {hand.shape} in {src_path}')
+        resolved_hand_type = resolve_hand_type(hand_type, hand.shape[1], src_path)
         if len(arm) != len(hand):
             raise ValueError(f'arm/hand length mismatch {len(arm)} vs {len(hand)} in {src_path}')
 
-        qpos = np.concatenate([arm, hand], axis=1)  # (T, 16)
+        qpos = np.concatenate([arm, hand], axis=1)  # Inspire: 12, L10: 16
         action = np.empty_like(qpos)
         action[:-1] = qpos[1:]
         action[-1] = qpos[-1]
+
+        wrist_pose = None
+        action_wrist_pose = None
+        wrist_pose_key = '/observations/wrist_pose_base'
+        if wrist_pose_key in src:
+            wrist_pose = np.asarray(src[wrist_pose_key][()], dtype=np.float32)
+            if wrist_pose.shape != (len(qpos), 6):
+                raise ValueError(
+                    f'unexpected wrist_pose_base shape {wrist_pose.shape} in {src_path}'
+                )
+            action_wrist_pose = np.empty_like(wrist_pose)
+            action_wrist_pose[:-1] = wrist_pose[1:]
+            action_wrist_pose[-1] = wrist_pose[-1]
 
         observations_by_name = {}
         for cam_name in camera_names:
@@ -97,9 +146,14 @@ def convert_episode(src_path, dst_path, camera_names=None, compression=None):
                     dst.attrs[k] = v
                 except Exception:
                     pass
+            dst.attrs['hand_type'] = resolved_hand_type
+            dst.attrs['hand_dim'] = hand.shape[1]
+            dst.attrs['state_dim'] = qpos.shape[1]
 
             obs = dst.create_group('observations')
             obs.create_dataset('qpos', data=qpos, **ds_kw)
+            if wrist_pose is not None:
+                obs.create_dataset('wrist_pose_base', data=wrist_pose, **ds_kw)
             img_grp = obs.create_group('images')
             depth_names = [name for name in camera_names if is_depth_name(name)]
             depth_grp = obs.create_group('depth') if depth_names else None
@@ -110,8 +164,12 @@ def convert_episode(src_path, dst_path, camera_names=None, compression=None):
                     cam_name, data=values, chunks=chunks, **ds_kw
                 )
             dst.create_dataset('action', data=action, **ds_kw)
+            if action_wrist_pose is not None:
+                dst.create_dataset(
+                    'action_wrist_pose_base', data=action_wrist_pose, **ds_kw
+                )
 
-    return len(qpos), qpos.shape[1]
+    return len(qpos), qpos.shape[1], resolved_hand_type
 
 
 def main():
@@ -119,7 +177,7 @@ def main():
     parser.add_argument(
         '--src_dir',
         type=str,
-        default='/mnt/additional/Data/DexMimic_Data/Robot_data/Insert_cup/l10',
+        default='/mnt/additional/Data/DexMimic_Data/Robot_data/Peach_in_bowl/inspire',
     )
     parser.add_argument(
         '--dst_dir',
@@ -140,6 +198,13 @@ def main():
         type=str,
         default=None,
         help='兼容旧参数：单相机名；若设置则覆盖 --camera_names',
+    )
+    parser.add_argument(
+        '--hand_type',
+        type=str,
+        default='auto',
+        choices=['auto', 'l10', 'inspire'],
+        help='手型；auto 按 hand_joints 维数识别（10→l10，6→inspire）',
     )
     parser.add_argument('--overwrite', action='store_true', help='overwrite existing outputs')
     parser.add_argument(
@@ -169,16 +234,26 @@ def main():
     print(f'source: {args.src_dir}  ({len(items)} episodes)')
     print(f'dest:   {args.dst_dir}')
     print(f'cameras: {camera_names}')
+    print(f'hand type: {args.hand_type}')
     print(f'compression: {args.compression}')
     print(f'qpos = concat(arm_joints, hand_joints), action[t]=qpos[t+1], sim=False')
 
     lengths = []
     out_ids = []
+    state_dims = set()
+    detected_hand_types = set()
     for old_idx, name in tqdm(items, desc='convert'):
         src_path = os.path.join(args.src_dir, name)
         dst_path = os.path.join(args.dst_dir, f'episode_{old_idx}.hdf5')
         if os.path.exists(dst_path) and not args.overwrite:
             try:
+                with h5py.File(src_path, 'r') as src:
+                    source_hand_dim = src['/observations/hand_joints'].shape[1]
+                    source_hand_type = resolve_hand_type(
+                        args.hand_type, source_hand_dim, src_path
+                    )
+                    source_state_dim = 6 + source_hand_dim
+                    source_has_wrist_pose = '/observations/wrist_pose_base' in src
                 with h5py.File(dst_path, 'r') as f:
                     expected = [
                         (
@@ -188,24 +263,56 @@ def main():
                         )
                         for c in camera_names
                     ]
-                    if '/action' in f and all(key in f for key in expected):
+                    pose_complete = (
+                        not source_has_wrist_pose
+                        or (
+                            '/observations/wrist_pose_base' in f
+                            and '/action_wrist_pose_base' in f
+                        )
+                    )
+                    output_state_dim = (
+                        f['/observations/qpos'].shape[1]
+                        if '/observations/qpos' in f else None
+                    )
+                    if (
+                        '/action' in f
+                        and all(key in f for key in expected)
+                        and pose_complete
+                        and output_state_dim == source_state_dim
+                    ):
                         lengths.append(len(f['/action']))
                         out_ids.append(old_idx)
+                        state_dims.add(source_state_dim)
+                        detected_hand_types.add(source_hand_type)
                         continue
             except Exception:
                 pass
             os.remove(dst_path)
-        T, D = convert_episode(
+        T, D, detected_hand_type = convert_episode(
             src_path,
             dst_path,
             camera_names=camera_names,
             compression=compression,
+            hand_type=args.hand_type,
         )
         lengths.append(T)
         out_ids.append(old_idx)
+        state_dims.add(D)
+        detected_hand_types.add(detected_hand_type)
+
+    if len(state_dims) != 1 or len(detected_hand_types) != 1:
+        raise RuntimeError(
+            '源目录混有不同手型/状态维数: '
+            f'hand_types={sorted(detected_hand_types)}, '
+            f'state_dims={sorted(state_dims)}'
+        )
+
+    state_dim = next(iter(state_dims))
+    detected_hand_type = next(iter(detected_hand_types))
 
     print(f'\ndone: {len(lengths)} files -> {args.dst_dir}')
-    print(f'qpos/action dim: 16')
+    print(f'hand type: {detected_hand_type}')
+    print(f'qpos/action dim: {state_dim}')
     print(f'cameras written: {camera_names}')
     print(f'episode length: min={min(lengths)} max={max(lengths)} '
           f'mean={np.mean(lengths):.1f} median={np.median(lengths):.1f}')
