@@ -1,96 +1,54 @@
-# ACT: Action Chunking with Transformers
+# MultiMimic
 
-### *New*: [ACT tuning tips](https://docs.google.com/document/d/1FVIZfoALXg_ZkYKaYVh-qOlaXveq5CtvJHXkY25eYhs/edit?usp=sharing)
-TL;DR: if your ACT policy is jerky or pauses in the middle of an episode, just train for longer! Success rate and smoothness can improve way after loss plateaus.
+精简后的仓库保留两条模型链路：
 
-#### Project Website: https://tonyzhaozh.github.io/aloha/
+- RM65 + L10/Inspire 双 decoder ACT：训练、数据转换、离线测试和真机部署。
+- `pointcloud_embedding`：编码器、解码器、训练脚本及权重。
 
-This repo contains the implementation of ACT, together with 2 simulated environments:
-Transfer Cube and Bimanual Insertion. You can train and evaluate ACT in sim or real.
-For real, you would also need to install [ALOHA](https://github.com/tonyzhaozh/aloha).
+## 主要文件
 
-### Updates:
-You can find all scripted/human demo for simulated environments [here](https://drive.google.com/drive/folders/1gPR03v05S1xiInoVJn7G7VJ9pDCnxq9O?usp=share_link).
+- `imitate_episodes.py`：双 decoder ACT 训练入口。
+- `policy.py`：ACT policy、关节损失及可选 FK 位姿监督。
+- `detr/`：双 decoder ACT 模型、Transformer、backbone 和 RM65 FK。
+- `convert_to_act_schema.py`：将 L10/Inspire HDF5 转换为 ACT schema。
+- `offline_test.py`：checkpoint 单帧/全局离线预测及 FK 对比。
+- `eval.py`：RM65 + L10/Inspire 真机部署。
+- `constants.py`：当前数据集任务配置。
+- `utils.py`、`depth_utils.py`：数据加载与预处理。
+- `dinov2/`：可选 DINOv2 图像 backbone。
+- `linker_hand_python_sdk/`：L10 部署 SDK。
+- `pointcloud_embedding/`：点云表征模型完整内容。
+- `checkpoints/`：当前训练权重与统计文件（被 Git 忽略）。
 
+## ACT 训练
 
-### Repo Structure
-- ``imitate_episodes.py`` Train and Evaluate ACT
-- ``policy.py`` An adaptor for ACT policy
-- ``detr`` Model definitions of ACT, modified from DETR
-- ``sim_env.py`` Mujoco + DM_Control environments with joint space control
-- ``ee_sim_env.py`` Mujoco + DM_Control environments with EE space control
-- ``scripted_policy.py`` Scripted policies for sim environments
-- ``constants.py`` Constants shared across files
-- ``utils.py`` Utils such as data loading and helper functions
-- ``visualize_episodes.py`` Save videos from a .hdf5 dataset
+```bash
+python imitate_episodes.py \
+  --task_name sim_Peach_in_bowl_inspire \
+  --ckpt_dir checkpoints/Peach_dual_decoder_inspire \
+  --policy_class ACT --backbone resnet18 \
+  --kl_weight 10 --chunk_size 50 --hidden_dim 512 \
+  --dim_feedforward 3200 --batch_size 8 \
+  --num_epochs 5000 --lr 1e-5 --seed 0
+```
 
+启用 FK 位姿监督时增加：
 
-### Installation
+```bash
+--fk_pose_weight 1.0 --fk_rotation_weight 1.0
+```
 
-    conda create -n aloha python=3.8.10
-    conda activate aloha
-    pip install torchvision
-    pip install torch
-    pip install pyquaternion
-    pip install pyyaml
-    pip install rospkg
-    pip install pexpect
-    pip install mujoco==2.3.7
-    pip install dm_control==1.0.14
-    pip install opencv-python
-    pip install matplotlib
-    pip install einops
-    pip install packaging
-    pip install h5py
-    pip install ipython
-    cd act/detr && pip install -e .
+## 测试与部署
 
-### Example Usages
+```bash
+# 离线单帧测试
+python offline_test.py --hdf5_path 0 --obs_frame -50
 
-To set up a new terminal, run:
+# 离线全局测试
+python offline_test.py --hdf5_path 0 --global
 
-    conda activate aloha
-    cd <path to act repo>
+# 真机部署（先在 eval.py 配置 checkpoint、相机和手型）
+python eval.py
+```
 
-### Simulated experiments
-
-We use ``sim_transfer_cube_scripted`` task in the examples below. Another option is ``sim_insertion_scripted``.
-To generated 50 episodes of scripted data, run:
-
-    python3 record_sim_episodes.py \
-    --task_name sim_transfer_cube_scripted \
-    --dataset_dir <data save dir> \
-    --num_episodes 50
-
-To can add the flag ``--onscreen_render`` to see real-time rendering.
-To visualize the episode after it is collected, run
-
-    python3 visualize_episodes.py --dataset_dir <data save dir> --episode_idx 0
-
-To train ACT:
-    
-    # Transfer Cube task
-    python3 imitate_episodes.py \
-    --task_name sim_transfer_cube_scripted \
-    --ckpt_dir <ckpt dir> \
-    --policy_class ACT --kl_weight 10 --chunk_size 100 --hidden_dim 512 --batch_size 8 --dim_feedforward 3200 \
-    --num_epochs 2000  --lr 1e-5 \
-    --seed 0
-
-    python3 imitate_episodes.py \
-    --task_name sim_Pick_Place_intoplate \
-    --ckpt_dir /home/ub/data/Robot_data/Pick_Place_intoplate \
-    --policy_class ACT --kl_weight 10 --chunk_size 100 --hidden_dim 512 --batch_size 8 --dim_feedforward 3200 \
-    --num_epochs 2000  --lr 1e-5 \
-    --seed 0
-
-
-To evaluate the policy, run the same command but add ``--eval``. This loads the best validation checkpoint.
-The success rate should be around 90% for transfer cube, and around 50% for insertion.
-To enable temporal ensembling, add flag ``--temporal_agg``.
-Videos will be saved to ``<ckpt_dir>`` for each rollout.
-You can also add ``--onscreen_render`` to see real-time rendering during evaluation.
-
-For real-world data where things can be harder to model, train for at least 5000 epochs or 3-4 times the length after the loss has plateaued.
-Please refer to [tuning tips](https://docs.google.com/document/d/1FVIZfoALXg_ZkYKaYVh-qOlaXveq5CtvJHXkY25eYhs/edit?usp=sharing) for more info.
-
+RM65、RealSense、CAN/Modbus 等硬件依赖需在部署环境中单独安装和配置。

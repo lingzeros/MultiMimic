@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from model.emEncoder import (
+from models.emEncoder import (
     PointCloudSequenceEncoder,
     LearnablePositionalEncoding,
     temporal_contrastive_loss,

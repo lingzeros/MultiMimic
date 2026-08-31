@@ -177,12 +177,12 @@ def main():
     parser.add_argument(
         '--src_dir',
         type=str,
-        default='/mnt/additional/Data/DexMimic_Data/Robot_data/Peach_in_bowl/inspire',
+        default='/mnt/additional/Data/DexMimic_Data/Robot_data/Insert_cup/inspire',
     )
     parser.add_argument(
         '--dst_dir',
         type=str,
-        default='/mnt/additional/Data/DexMimic_Data/Robot_data_ACT/Insert_cup',
+        default='/mnt/additional/Data/DexMimic_Data/Robot_data_ACT/Insert_cup/inspire',
     )
     parser.add_argument(
         '--camera_names',

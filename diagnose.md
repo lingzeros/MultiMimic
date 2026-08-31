@@ -1,2 +1,0 @@
-当前效果较好的ckpt:checkpoint_peach_single_cam
-但是早上效果较好，晚上同ckpt有问题  尝试添加图像增强
