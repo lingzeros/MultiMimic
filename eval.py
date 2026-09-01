@@ -18,7 +18,7 @@ _ROOT = os.path.dirname(os.path.abspath(__file__))
 _LINKER_HAND_DIR = os.path.join(_ROOT, 'linker_hand_python_sdk', 'LinkerHand')
 _LINKER_SDK_DIR = os.path.join(_ROOT, 'linker_hand_python_sdk')
 
-CKPT_DIR = "/home/ub/MultiMimic/checkpoints/Cup_dual_1"
+CKPT_DIR = "/home/ub/MultiMimic/checkpoints/Cup_dual_fk_pose"
 CKPT_TYPE = 'policy_best.ckpt'
 # CKPT_TYPE = 'policy_epoch_4800_seed_0.ckpt'
 # camera_names 是 depth encoder 的唯一开关；
@@ -707,7 +707,7 @@ def main():
     # 与 imitate_episodes 一致：temporal_agg 时每步重查询；否则间隔 = chunk_size
     query_frequency = policy_config['num_queries'] if policy_class == 'ACT' else 1
     num_queries = policy_config['num_queries']
-    execution_horizon = 15
+    execution_horizon = 13
     if  policy_class == 'ACT':
         if temporal_agg:
             query_frequency = 1

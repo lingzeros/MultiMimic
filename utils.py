@@ -76,27 +76,23 @@ from depth_utils import is_depth_name, normalize_depth
 
 # 可选的截断版本 - 如果不想填充太多零的话
 class EpisodicDataset(torch.utils.data.Dataset):
-    def __init__(self, episode_ids, dataset_dir, camera_names, norm_stats,
+    def __init__(self, episode_paths, camera_names, norm_stats,
                  fixed_len=300, use_fk_pose=False):
         super(EpisodicDataset).__init__()
-        self.episode_ids = episode_ids
-        self.dataset_dir = dataset_dir
+        self.episode_paths = [str(path) for path in episode_paths]
         self.camera_names = camera_names
         self.norm_stats = norm_stats
-        self.is_sim = None
+        self.is_sim = False
         self.fixed_len = fixed_len  # 固定长度，可以设为你数据的中位数长度
         self.use_fk_pose = use_fk_pose
-        
-        self.__getitem__(0) # initialize self.is_sim
 
     def __len__(self):
-        return len(self.episode_ids)
+        return len(self.episode_paths)
 
     def __getitem__(self, index):
         sample_full_episode = False # hardcode
 
-        episode_id = self.episode_ids[index]
-        dataset_path = os.path.join(self.dataset_dir, f'episode_{episode_id}.hdf5')
+        dataset_path = self.episode_paths[index]
         with h5py.File(dataset_path, 'r') as root:
             is_sim = root.attrs['sim']
             original_action_shape = root['/action'].shape
@@ -227,7 +223,7 @@ class EpisodicDataset(torch.utils.data.Dataset):
 
 #     return stats
 
-def get_norm_stats(dataset_dir, num_episodes, use_fk_pose=False):
+def get_norm_stats(episode_paths, use_fk_pose=False):
     all_qpos_data = []
     all_action_data = []
     all_wrist_pose_data = []
@@ -237,18 +233,16 @@ def get_norm_stats(dataset_dir, num_episodes, use_fk_pose=False):
     episode_lengths = []
     
     print("正在检查episode长度...")
-    for episode_idx in range(num_episodes):
-        dataset_path = os.path.join(dataset_dir, f'episode_{episode_idx}.hdf5')
-        if not os.path.exists(dataset_path):
-            print(f"警告: 文件 {dataset_path} 不存在，跳过...")
-            continue
-            
+    for dataset_path in episode_paths:
         with h5py.File(dataset_path, 'r') as root:
             qpos = root['/observations/qpos'][()]
             episode_len = len(qpos)
             episode_lengths.append(episode_len)
             max_len = max(max_len, episode_len)
-            print(f"Episode {episode_idx}: {episode_len} timesteps")
+            print(f"{dataset_path}: {episode_len} timesteps")
+
+    if not episode_lengths:
+        raise RuntimeError('No episodes available for normalization statistics')
     
     print(f"\n找到的最大episode长度: {max_len}")
     print(f"最小episode长度: {min(episode_lengths)}")
@@ -256,11 +250,7 @@ def get_norm_stats(dataset_dir, num_episodes, use_fk_pose=False):
     
     # 第二步：加载数据并填充到相同长度
     print("\n正在加载和填充数据...")
-    for episode_idx in range(num_episodes):
-        dataset_path = os.path.join(dataset_dir, f'episode_{episode_idx}.hdf5')
-        if not os.path.exists(dataset_path):
-            continue
-            
+    for dataset_path in episode_paths:
         with h5py.File(dataset_path, 'r') as root:
             qpos = root['/observations/qpos'][()]
             # qvel = root['/observations/qvel'][()]
@@ -285,7 +275,7 @@ def get_norm_stats(dataset_dir, num_episodes, use_fk_pose=False):
             # 如果当前episode长度小于最大长度，进行填充
             if current_len < max_len:
                 pad_len = max_len - current_len
-                print(f"Episode {episode_idx}: 填充 {pad_len} 个timesteps")
+                print(f"{dataset_path}: 填充 {pad_len} 个timesteps")
                 
                 # 使用最后一个值进行填充 (edge padding)
                 qpos_padded = np.pad(qpos, ((0, pad_len), (0, 0)), mode='edge')
@@ -344,18 +334,62 @@ def get_norm_stats(dataset_dir, num_episodes, use_fk_pose=False):
     return stats
 
 
-def load_data(dataset_dir, num_episodes, camera_names, batch_size_train,
+def _resolve_dataset_sources(dataset_sources, num_episodes=None):
+    """Resolve one legacy directory or multiple configured dataset sources."""
+    if isinstance(dataset_sources, (str, os.PathLike)):
+        if num_episodes is None:
+            raise ValueError('num_episodes is required for a single dataset_dir')
+        dataset_sources = [{
+            'name': 'dataset',
+            'dataset_dir': str(dataset_sources),
+            'num_episodes': int(num_episodes),
+        }]
+
+    resolved = []
+    for source_index, source in enumerate(dataset_sources):
+        dataset_dir = source['dataset_dir']
+        count = int(source['num_episodes'])
+        name = source.get('name', f'source_{source_index}')
+        paths = [
+            os.path.join(dataset_dir, f'episode_{episode_id}.hdf5')
+            for episode_id in range(count)
+        ]
+        missing = [path for path in paths if not os.path.isfile(path)]
+        if missing:
+            raise FileNotFoundError(
+                f'{name}: {len(missing)} configured episodes are missing; '
+                f'first missing file: {missing[0]}'
+            )
+        resolved.append((name, paths))
+    if not resolved:
+        raise ValueError('dataset_sources must contain at least one source')
+    return resolved
+
+
+def load_data(dataset_sources, num_episodes, camera_names, batch_size_train,
               batch_size_val, use_fk_pose=False, state_dim=None):
-    print(f'\nData from: {dataset_dir}\n')
-    # obtain train test split
+    resolved_sources = _resolve_dataset_sources(dataset_sources, num_episodes)
+    print('\nData sources:')
+    for name, paths in resolved_sources:
+        print(f'  {name}: {len(paths)} episodes from {os.path.dirname(paths[0])}')
+
+    # Split every source independently so both domains are represented in
+    # training and validation.
     train_ratio = 0.8
-    shuffled_indices = np.random.permutation(num_episodes)
-    train_indices = shuffled_indices[:int(train_ratio * num_episodes)]
-    val_indices = shuffled_indices[int(train_ratio * num_episodes):]
+    train_paths = []
+    val_paths = []
+    all_paths = []
+    for _, paths in resolved_sources:
+        shuffled_indices = np.random.permutation(len(paths))
+        split = int(train_ratio * len(paths))
+        train_paths.extend(paths[index] for index in shuffled_indices[:split])
+        val_paths.extend(paths[index] for index in shuffled_indices[split:])
+        all_paths.extend(paths)
+    print(f'  combined: train={len(train_paths)}, val={len(val_paths)}')
 
     # obtain normalization stats for qpos and action
     norm_stats = get_norm_stats(
-        dataset_dir, num_episodes, use_fk_pose=use_fk_pose,
+        all_paths, use_fk_pose=use_fk_pose,
     )
     if state_dim is not None:
         qpos_dim = int(np.asarray(norm_stats['qpos_mean']).shape[0])
@@ -364,16 +398,16 @@ def load_data(dataset_dir, num_episodes, camera_names, batch_size_train,
             raise ValueError(
                 'Configured state_dim does not match dataset: '
                 f'state_dim={state_dim}, qpos_dim={qpos_dim}, '
-                f'action_dim={action_dim}, dataset_dir={dataset_dir}'
+                f'action_dim={action_dim}'
             )
 
     # construct dataset and dataloader
     train_dataset = EpisodicDataset(
-        train_indices, dataset_dir, camera_names, norm_stats,
+        train_paths, camera_names, norm_stats,
         use_fk_pose=use_fk_pose,
     )
     val_dataset = EpisodicDataset(
-        val_indices, dataset_dir, camera_names, norm_stats,
+        val_paths, camera_names, norm_stats,
         use_fk_pose=use_fk_pose,
     )
     train_dataloader = DataLoader(train_dataset, batch_size=batch_size_train, shuffle=True, pin_memory=True, num_workers=1, prefetch_factor=1)

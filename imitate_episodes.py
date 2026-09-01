@@ -26,8 +26,10 @@ def main(args):
 
     # get task parameters
     task_config = SIM_TASK_CONFIGS[task_name]
-    dataset_dir = task_config['dataset_dir']
-    num_episodes = task_config['num_episodes']
+    dataset_sources = task_config.get(
+        'dataset_sources', task_config.get('dataset_dir'),
+    )
+    num_episodes = task_config.get('num_episodes')
     camera_names = task_config['camera_names']
 
     # A task-specific dimension is authoritative (e.g. Inspire: arm 6 + hand 6
@@ -73,7 +75,7 @@ def main(args):
 
     use_fk_pose = policy_class == 'ACT' and args['fk_pose_weight'] > 0
     train_dataloader, val_dataloader, stats, _ = load_data(
-        dataset_dir,
+        dataset_sources,
         num_episodes,
         camera_names,
         batch_size_train,

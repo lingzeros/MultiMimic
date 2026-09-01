@@ -38,6 +38,22 @@ python imitate_episodes.py \
 --fk_pose_weight 1.0 --fk_rotation_weight 1.0
 ```
 
+Human + Robot 双路径协同训练使用内置任务配置：
+
+```bash
+python imitate_episodes.py \
+  --task_name sim_Peach_in_bowl_inspire_human_robot \
+  --ckpt_dir checkpoints/Peach_human_robot \
+  --policy_class ACT --backbone resnet18 \
+  --kl_weight 10 --chunk_size 50 --hidden_dim 512 \
+  --dim_feedforward 3200 --batch_size 8 \
+  --num_epochs 5000 --lr 1e-5 --seed 0 \
+  --fk_pose_weight 1.0 --fk_rotation_weight 1.0
+```
+
+两个数据源会分别进行 80/20 划分后合并，联合计算 normalization
+statistics。路径和 episode 数量由 `constants.py` 的 `dataset_sources` 配置。
+
 ## 测试与部署
 
 ```bash
